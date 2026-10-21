@@ -75,6 +75,26 @@ def page_text(html: str) -> tuple[str, list[str]]:
     return text, extras
 
 
+def _iban_prefix(candidate: str):
+    """The regex can run on into following words ("...7788 I WILL"), so try
+    the country's IBAN length first, then shorter prefixes."""
+    compact = re.sub(r"\s", "", candidate)
+    lengths = [ids._IBAN_LEN[compact[:2]]] if compact[:2] in ids._IBAN_LEN else \
+        range(min(34, len(compact)), 14, -1)
+    for n in lengths:
+        ident = ids.iban(compact[:n])
+        if ident:
+            # rebuild the raw text as written (with its spaces) for masking
+            raw, k = "", 0
+            for ch in candidate:
+                if k == n:
+                    break
+                raw += ch
+                k += not ch.isspace()
+            return ident, raw
+    return None, candidate
+
+
 def _uk_accounts(text: str):
     used = set()
     sorts = [(m.start(), m.end(), m.group(1)) for m in _SORT.finditer(text)]
@@ -115,7 +135,8 @@ def extract(html: str, url: str = "") -> list[Finding]:
         add(ident, snip)
 
     for m in _IBAN.finditer(blob.upper()):
-        add(ids.iban(m.group(0)), _snippet(blob, m.start(), m.end()), m.group(0))
+        ident, raw = _iban_prefix(m.group(0))
+        add(ident, _snippet(blob, m.start(), m.end()), raw)
 
     for rx, fn in ((_ETH, ids.eth), (_TRON, ids.tron), (_BTC, ids.btc)):
         for m in rx.finditer(blob):

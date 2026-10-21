@@ -1,4 +1,4 @@
-# ScamTrace (prototype v0.2)
+# ScamTrace (prototype v0.3)
 
 ScamTrace tells a payment firm, at the moment a payment is made or received,
 whether the payee is collecting money for a **live scam campaign on social
@@ -60,8 +60,20 @@ submissions.
 
 ### The AI layer (`scamtrace/ai.py`)
 
-Claude (vision) analyses two kinds of input and returns structured output
-through a forced tool call:
+A vision language model analyses two kinds of input and returns structured
+output through a forced tool call. The model is **pluggable**
+(`SCAMTRACE_PROVIDER` in `.env`):
+
+| Provider | What it is | Needs |
+|---|---|---|
+| `claude` (default) | Anthropic Claude | `ANTHROPIC_API_KEY` |
+| `openai` | OpenAI GPT models | `OPENAI_API_KEY`, `SCAMTRACE_MODEL` |
+| `gemini` | Google Gemini (OpenAI-compatible endpoint) | `GEMINI_API_KEY`, `SCAMTRACE_MODEL` |
+| `ollama` | Open-weights vision models running on your own machine | Ollama running, `SCAMTRACE_MODEL` |
+| `openai_compatible` | Any other OpenAI-compatible server, e.g. vLLM or a hosted open model | `SCAMTRACE_BASE_URL`, `SCAMTRACE_MODEL` |
+| `heuristic` | Keyword scorer, no model | nothing |
+
+It analyses:
 
 * **Posts and ads**: verdict and likelihood, scam type (investment,
   purchase, job, romance, impersonation, giveaway, loan, rental), who it
@@ -81,6 +93,37 @@ Safeguards:
   "unverified" and never stored as a payee.
 * **Offline fallback.** Without an API key a transparent keyword heuristic
   runs instead. It is text-only and is the baseline the AI must beat.
+
+### Choosing a model, and the path to our own models
+
+`python -m scamtrace.evaluate` scores any set of providers on a labelled
+set of posts and writes `results.md`, `results.csv` and per-post details:
+
+```bash
+python eval/make_sample.py      # 14 synthetic posts: shows the format only
+python -m scamtrace.evaluate eval/sample.jsonl \
+    --providers claude,openai:MODEL,gemini:MODEL,ollama:MODEL,heuristic
+```
+
+It reports scam-detection precision, recall and F1; scam-type accuracy;
+how many expected payment details the full pipeline found and how many it
+found wrongly; errors; seconds per post; tokens; and cost if you supply a
+price file (`--prices`). Prices are not built in because they change.
+
+**Use a real labelled set for decisions.** Fourteen synthetic posts show
+the format but cannot rank models. Aim for at least 200 real posts (about
+half scams, half genuine posts that look similar: sales, jobs, savings
+products, private sellers), labelled and double-checked. Keep real data in
+`eval/real/`, which git ignores, because screenshots can contain personal
+data.
+
+Plan: frontier models label data and handle rare cases now. Analyst-
+confirmed labels build a proprietary dataset. Smaller in-house models
+(scam-post classifier, screenshot payment-detail extractor, mule-risk
+scorer) are trained on it and run on our own infrastructure, which also
+keeps payment-firm data away from outside providers. This script is how
+each in-house model is judged against the frontier models before it
+replaces them.
 
 ### Linking into campaigns (`cluster.py`)
 
@@ -104,7 +147,7 @@ source .venv/bin/activate
 cp .env.example .env               # then paste your ANTHROPIC_API_KEY into .env
 
 python demo/run_demo.py            # end-to-end demo, writes demo/output/
-python -m pytest                   # 28 tests, no network or API key needed
+python -m pytest                   # 35 tests, no network or API key needed
 bash run_api.sh                    # API on the demo data: http://127.0.0.1:8000/docs
 ```
 
@@ -147,9 +190,10 @@ and records shaped like the Meta and TikTok API responses.
   the risk of flagging an account that was hijacked or reused.
 * **Video.** TikTok ads are mostly video. The prototype reads images and
   video cover frames only. Next steps: sampled frames and speech-to-text.
-* **Accuracy on real data**: precision and recall of the AI and the
-  validators on a labelled sample of real scam and legitimate posts, versus
-  the keyword baseline.
+* **Accuracy on real data**: build the real labelled set and run the
+  evaluation script across providers and the keyword baseline.
+* **In-house models**: train and evaluate the first specialised model
+  (scam-post classifier) once enough confirmed labels exist.
 * **Stable campaign IDs**: a campaign's ID can change when two campaigns
   merge. Production needs a persistent ID with merge history.
 * **Bank-grade engineering**: UK modulus checking, client-side hashed

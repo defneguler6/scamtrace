@@ -1,4 +1,9 @@
-"""AI layer: Claude reads social posts, ads and payment pages.
+"""AI layer: a vision language model reads social posts, ads and payment pages.
+
+The model is pluggable (see Backend classes): Claude by default, or any
+OpenAI-compatible API, which covers OpenAI GPT models, Google Gemini and
+open-weights models served locally (Ollama, vLLM). Choose with
+SCAMTRACE_PROVIDER and compare them with `python -m scamtrace.evaluate`.
 
 Two jobs:
   * social_post / advert: is this a scam, what kind, who does it impersonate,
@@ -25,8 +30,11 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import re
+import sys
+import time
 from typing import Any
 
 from . import identifiers as ids
@@ -49,9 +57,9 @@ TOOL = {
             "scam_likelihood": {"type": "number", "minimum": 0, "maximum": 1},
             "scam_type": {"type": "string", "enum": SCAM_TYPES},
             "impersonates": {
-                "type": ["string", "null"],
+                "type": "string",
                 "description": "Brand, bank, platform or public figure the content "
-                               "pretends to be or falsely uses, if any.",
+                               "pretends to be or falsely uses; empty string if none.",
             },
             "red_flags": {
                 "type": "array",
@@ -96,7 +104,8 @@ TOOL = {
                                                "shown, e.g. 'Sort code 00-12-34 "
                                                "Account 12345678'. Never guess or "
                                                "complete missing characters."},
-                        "payee_name": {"type": ["string", "null"]},
+                        "payee_name": {"type": "string",
+                                       "description": "Empty string if not shown."},
                         "seen_in": {"type": "string", "enum": ["text", "image"]},
                     },
                     "required": ["kind", "raw", "seen_in"],
@@ -163,15 +172,16 @@ def _image_block(data: bytes) -> dict | None:
             data, media = buf.getvalue(), "image/jpeg"
     except ImportError:
         pass
-    return {"type": "image",
-            "source": {"type": "base64", "media_type": media,
-                       "data": base64.b64encode(data).decode()}}
+    return {"media_type": media, "data": base64.b64encode(data).decode()}
 
 
-class Analyser:
-    """Claude-backed analyser. Pass a client in tests."""
+# ------------------------------------------------------------- backends
 
-    engine = "claude"
+
+class AnthropicBackend:
+    """Claude through the Anthropic Messages API."""
+
+    provider = "claude"
 
     def __init__(self, client: Any = None, model: str | None = None):
         if client is None:
@@ -180,31 +190,130 @@ class Analyser:
         self.client = client
         self.model = model or os.environ.get("SCAMTRACE_MODEL", DEFAULT_MODEL)
 
-    def analyse(self, kind: str, text: str = "", images: list[bytes] = (),
-                context: dict | None = None) -> dict:
-        ctx = "\n".join(f"{k}: {v}" for k, v in (context or {}).items() if v)
-        content: list[dict] = []
-        for img in list(images)[:4]:
-            block = _image_block(img)
-            if block:
-                content.append(block)
-        content.append({"type": "text", "text": (
-            f"{TASK[kind]}\n\n<context>\n{ctx}\n</context>\n\n"
-            f"<content>\n{(text or '')[:20000]}\n</content>")})
+    def complete(self, system: str, images: list[dict], text: str) -> tuple[dict, dict]:
+        content = [{"type": "image", "source": {"type": "base64", **img}} for img in images]
+        content.append({"type": "text", "text": text})
         resp = self.client.messages.create(
             model=self.model,
             max_tokens=2000,
-            system=SYSTEM,
+            system=system,
             tools=[TOOL],
             tool_choice={"type": "tool", "name": TOOL["name"]},
             messages=[{"role": "user", "content": content}],
         )
+        u = getattr(resp, "usage", None)
+        usage = {"input_tokens": getattr(u, "input_tokens", 0) or 0,
+                 "output_tokens": getattr(u, "output_tokens", 0) or 0}
         for block in resp.content:
             if getattr(block, "type", "") == "tool_use":
-                out = dict(block.input)
-                out["engine"] = f"claude:{self.model}"
-                return _clean(out)
+                return dict(block.input), usage
         raise RuntimeError("model did not return an analysis")
+
+
+# Known OpenAI-compatible endpoints. Model names change often, so the model
+# is always taken from SCAMTRACE_MODEL for these providers.
+OPENAI_COMPATIBLE = {
+    "openai": ("https://api.openai.com/v1", "OPENAI_API_KEY"),
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY"),
+    "ollama": ("http://localhost:11434/v1", None),   # local open-weights models
+    "openai_compatible": (None, "OPENAI_COMPATIBLE_API_KEY"),  # vLLM, other hosts
+}
+
+
+class OpenAICompatibleBackend:
+    """Any API that speaks the OpenAI chat-completions format with tools."""
+
+    def __init__(self, provider: str, model: str, base_url: str | None = None,
+                 api_key: str | None = None, http=None):
+        default_url, key_env = OPENAI_COMPATIBLE.get(provider, (None, None))
+        self.provider = provider
+        self.model = model
+        self.base_url = (base_url or os.environ.get("SCAMTRACE_BASE_URL") or default_url or "").rstrip("/")
+        if not self.base_url:
+            raise RuntimeError("set SCAMTRACE_BASE_URL for this provider")
+        self.api_key = api_key or (os.environ.get(key_env) if key_env else None)
+        if key_env and not self.api_key and provider != "openai_compatible":
+            raise RuntimeError(f"set {key_env}")
+        import httpx
+        self.http = http or httpx.Client(timeout=120)
+
+    def complete(self, system: str, images: list[dict], text: str) -> tuple[dict, dict]:
+        content = [{"type": "image_url",
+                    "image_url": {"url": f"data:{img['media_type']};base64,{img['data']}"}}
+                   for img in images]
+        content.append({"type": "text", "text": text})
+        body = {
+            "model": self.model,
+            "max_tokens": 2000,
+            "messages": [{"role": "system", "content": system},
+                         {"role": "user", "content": content}],
+            "tools": [{"type": "function", "function": {
+                "name": TOOL["name"], "description": TOOL["description"],
+                "parameters": TOOL["input_schema"]}}],
+            "tool_choice": {"type": "function", "function": {"name": TOOL["name"]}},
+        }
+        headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        r = self.http.post(f"{self.base_url}/chat/completions", json=body, headers=headers)
+        out = r.json()
+        if r.status_code >= 400 or "error" in out:
+            err = out.get("error") if isinstance(out, dict) else out
+            raise RuntimeError(f"{self.provider} API error: {err}")
+        msg = out["choices"][0]["message"]
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            raise RuntimeError("model did not return an analysis")
+        args = calls[0]["function"]["arguments"]
+        u = out.get("usage") or {}
+        usage = {"input_tokens": u.get("prompt_tokens", 0) or 0,
+                 "output_tokens": u.get("completion_tokens", 0) or 0}
+        return (json.loads(args) if isinstance(args, str) else dict(args)), usage
+
+
+class Analyser:
+    """Model-backed analyser. Give it a backend, or a Claude client (tests)."""
+
+    def __init__(self, client: Any = None, model: str | None = None, backend=None):
+        self.backend = backend or AnthropicBackend(client, model)
+
+    @property
+    def engine(self) -> str:
+        return self.backend.provider
+
+    @property
+    def model(self) -> str:
+        return self.backend.model
+
+    def analyse(self, kind: str, text: str = "", images: list[bytes] = (),
+                context: dict | None = None) -> dict:
+        ctx = "\n".join(f"{k}: {v}" for k, v in (context or {}).items() if v)
+        imgs = [b for b in (_image_block(i) for i in list(images)[:4]) if b]
+        prompt = (f"{TASK[kind]}\n\n<context>\n{ctx}\n</context>\n\n"
+                  f"<content>\n{(text or '')[:20000]}\n</content>")
+        t0 = time.perf_counter()
+        out, usage = self.backend.complete(SYSTEM, imgs, prompt)
+        out = _clean(out)
+        out["engine"] = f"{self.backend.provider}:{self.backend.model}"
+        out["usage"] = {**usage, "seconds": round(time.perf_counter() - t0, 2)}
+        out["images_read"] = bool(imgs)
+        return out
+
+
+def make_analyser(provider: str | None = None, model: str | None = None):
+    """Build an analyser for a provider name: claude, openai, gemini, ollama,
+    openai_compatible or heuristic."""
+    provider = (provider or os.environ.get("SCAMTRACE_PROVIDER") or "claude").lower()
+    if provider in ("heuristic", "off", "none"):
+        return HeuristicAnalyser()
+    if provider in ("claude", "anthropic"):
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError("set ANTHROPIC_API_KEY")
+        return Analyser(model=model)
+    if provider in OPENAI_COMPATIBLE:
+        model = model or os.environ.get("SCAMTRACE_MODEL")
+        if not model:
+            raise RuntimeError(f"set SCAMTRACE_MODEL to a {provider} model name")
+        return Analyser(backend=OpenAICompatibleBackend(provider, model))
+    raise RuntimeError(f"unknown provider {provider!r}")
 
 
 class HeuristicAnalyser:
@@ -242,17 +351,25 @@ class HeuristicAnalyser:
 
 
 def from_env():
-    """Claude if a key is configured, otherwise the heuristic."""
-    if os.environ.get("ANTHROPIC_API_KEY") and os.environ.get("SCAMTRACE_AI", "on") != "off":
-        try:
-            return Analyser()
-        except Exception:  # SDK missing or misconfigured
-            pass
-    return HeuristicAnalyser()
+    """The configured model, or the heuristic if it is not set up.
+
+    SCAMTRACE_PROVIDER picks the model provider (default: claude).
+    SCAMTRACE_AI=off forces the heuristic.
+    """
+    if os.environ.get("SCAMTRACE_AI", "on") == "off":
+        return HeuristicAnalyser()
+    try:
+        return make_analyser()
+    except Exception as e:  # key missing, SDK missing, misconfigured
+        if os.environ.get("SCAMTRACE_PROVIDER"):
+            print(f"[scamtrace] AI provider not available ({e}); using heuristic",
+                  file=sys.stderr)
+        return HeuristicAnalyser()
 
 
 def _clean(a: dict) -> dict:
-    a.setdefault("impersonates", None)
+    if not (a.get("impersonates") or "").strip() or str(a.get("impersonates")).lower() in ("none", "null"):
+        a["impersonates"] = None
     for k in ("red_flags", "calls_to_action", "payment_instructions"):
         a[k] = [x for x in a.get(k) or [] if isinstance(x, dict)]
     try:
@@ -261,7 +378,9 @@ def _clean(a: dict) -> dict:
         a["scam_likelihood"] = 0.0
     if a.get("scam_type") not in SCAM_TYPES:
         a["scam_type"] = "other"
-    a["images_read"] = True
+    for p in a["payment_instructions"]:
+        if not (p.get("payee_name") or "").strip():
+            p["payee_name"] = None
     return a
 
 

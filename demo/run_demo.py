@@ -11,8 +11,9 @@
 5. Runs payee checks the way a payment firm would.
 6. Writes evidence packs to demo/output/.
 
-With ANTHROPIC_API_KEY set the AI layer uses Claude (and reads screenshots);
-without it a keyword heuristic runs instead and images are not read.
+With a model configured in .env (Claude by default; GPT, Gemini or a local
+model via SCAMTRACE_PROVIDER) the AI layer reads posts and screenshots;
+without one a keyword heuristic runs instead and images are not read.
 """
 
 from __future__ import annotations
@@ -67,7 +68,7 @@ def main():
     servers = serve_sites(fx["ports"])
     api = TestClient(api_mod.app, headers={"X-API-Key": "demo-key"})
     engine = api_mod.analyser.engine
-    print(f"AI layer: {'Claude (' + api_mod.analyser.model + ')' if engine == 'claude' else 'OFF (keyword heuristic, screenshots not read). Set ANTHROPIC_API_KEY to turn it on.'}")
+    print(f"AI layer: {engine + ' (' + api_mod.analyser.model + ')' if engine != 'heuristic' else 'OFF (keyword heuristic, screenshots not read). Set ANTHROPIC_API_KEY (or another provider) in .env to turn it on.'}")
 
     print("\n== 1. Crawling adverts ==")
     for ad in fx["ads"]:
@@ -93,7 +94,7 @@ def main():
         print(f"{r['sighting_id']:<28} {r['verdict']:<17} {r['scam_likelihood']:.2f} "
               f"{r['scam_type']:<11} -> {r['campaign_id']}\n"
               f"{'':<28} payment: {pay}\n{'':<28} accounts/contacts: {con}")
-        if r.get("summary") and engine == "claude":
+        if r.get("summary") and engine != "heuristic":
             print(f"{'':<28} AI: {r['summary']}")
 
     print("[Instagram ad from Meta Ad Library API record]")
@@ -162,7 +163,7 @@ def main():
         (OUT / f"evidence_{c['id']}.html").write_text(html)
         print(f"{OUT / ('evidence_' + c['id'] + '.html')}")
 
-    if engine != "claude":
+    if engine == "heuristic":
         print("\nNote: AI was off, so the bank details that appear only in the TikTok "
               "screenshot (SUB-T1) were not read and that post is not linked to the "
               "purchase-scam campaign. Set ANTHROPIC_API_KEY and run again.")

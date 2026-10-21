@@ -9,3 +9,5 @@ evidence/
 .env
 .venv/
 .DS_Store
+eval/results/
+eval/real/

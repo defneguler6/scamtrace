@@ -100,3 +100,10 @@ def test_campaigns_link_by_payee_site_and_template():
     ]
     groups = sorted(sorted(m) for m in campaigns(s).values())
     assert groups == [["a", "b", "c", "d"], ["e"]]
+
+
+def test_iban_followed_by_words():
+    good = ids.iban_with_check_digits("GB", "TEST00440155667788")
+    assert kinds(f"pay the deposit to {good} I will post you the keys") == ["iban"]
+    spaced = " ".join(good[i:i + 4] for i in range(0, len(good), 4))
+    assert kinds(f"IBAN: {spaced} thank you") == ["iban"]

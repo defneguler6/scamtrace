@@ -73,7 +73,7 @@ class Store:
              text: str = "", ai: dict | None = None, **fields):
         cls = classify(text)
         scam_type = cls["scam_type"]
-        if ai and ai.get("engine", "").startswith("claude") and ai.get("scam_type"):
+        if ai and ai.get("engine") not in (None, "heuristic") and ai.get("scam_type"):
             scam_type = ai["scam_type"] if ai["scam_type"] != "none" else "unknown"
         row = {c: None for c in COLUMNS}
         row.update(fields)
