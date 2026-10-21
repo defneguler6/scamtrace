@@ -6,3 +6,6 @@ demo/fixtures.json
 evidence/
 .pytest_cache/
 *.egg-info/
+.env
+.venv/
+.DS_Store

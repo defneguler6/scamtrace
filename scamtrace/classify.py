@@ -15,6 +15,12 @@ SIGNALS = {
         r"\bdeposit\b", r"\bportfolio", r"\bwithdraw", r"\bbitcoin",
         r"\busdt\b", r"\bpassive income", r"\bplatform\b", r"\baccount manager",
     ],
+    "job": [
+        r"\bearn £?\d+\s*(?:a|per|/)\s*(?:day|hour)", r"\blike and review",
+        r"\b(?:simple|easy|online) tasks?\b", r"\bno experience", r"\bhr team\b",
+        r"\bwork from (?:your )?(?:phone|home)", r"\bstarter fee\b", r"\bactivate your account",
+        r"\bcommission\b", r"\brecruit",
+    ],
     "purchase": [
         r"\bbasket\b", r"\bcheckout\b", r"\bdelivery\b", r"\bclearance\b",
         r"\b\d{2}% off\b", r"\border\b", r"\bin stock\b", r"\bshipping\b",

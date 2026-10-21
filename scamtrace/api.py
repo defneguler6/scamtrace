@@ -1,7 +1,8 @@
 """HTTP API for payment firms.
 
     POST /v1/payee/check            is this payee linked to a live scam campaign?
-    POST /v1/sightings/ad           crawl a scam advert (internal / analyst use)
+    POST /v1/sightings/social       a TikTok / Instagram post: link, caption, screenshots
+    POST /v1/sightings/ad           crawl a scam advert landing page
     POST /v1/sightings/report       add a victim or partner report
     GET  /v1/campaigns              list campaigns
     GET  /v1/campaigns/{id}/evidence-pack?format=json|html
@@ -19,10 +20,14 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
-from . import evidence, identifiers
+import base64
+import binascii
+
+from . import ai, evidence, identifiers
 from .crawler import crawl
 from .extract import extract
-from .store import Store
+from .social import SocialItem, enrich_crawl, platform_of, process
+from .store import ADVERT_SOURCES, Store
 
 DB_PATH = os.environ.get("SCAMTRACE_DB", "scamtrace.db")
 EVIDENCE_DIR = Path(os.environ.get("SCAMTRACE_EVIDENCE", "evidence"))
@@ -34,6 +39,7 @@ app = FastAPI(
     description="Links payees to live advert-originated scam campaigns.",
 )
 store = Store(DB_PATH)
+analyser = ai.from_env()
 
 
 def auth(x_api_key: str = Header(default="")):
@@ -77,7 +83,9 @@ def check_payee(q: PayeeQuery):
     rows = store.lookup(ident.token)
     if not rows:
         return {"match": False, "risk": "none", "identifier": ident.masked}
-    from_ads = any(r["source"] == "ad_crawl" for r in rows)
+    if ident.kind not in identifiers.PAYMENT_KINDS:
+        raise HTTPException(422, "not a payment identifier")
+    from_ads = any(r["source"] in ADVERT_SOURCES for r in rows)
     risk = "high" if from_ads else "medium"
     cid = rows[0]["campaign_id"]
     c = store.campaign(cid)
@@ -85,17 +93,18 @@ def check_payee(q: PayeeQuery):
         "match": True,
         "risk": risk,
         "identifier": ident.masked,
-        "reason": ("Seen on the payment page of scam adverts"
+        "reason": ("Seen in scam adverts or posts, or on the payment pages they lead to"
                    if from_ads else "Reported by scam victims"),
         "first_seen": rows[0]["seen_at"],
         "last_seen": rows[-1]["seen_at"],
         "campaign": {
             "id": cid,
             "scam_type": c["scam_type"],
-            "ads_seen": sum(s["source"] == "ad_crawl" for s in c["sightings"]),
-            "victim_reports": sum(s["source"] != "ad_crawl" for s in c["sightings"]),
+            "ads_and_posts_seen": sum(s["source"] in ADVERT_SOURCES for s in c["sightings"]),
+            "victim_reports": sum(s["source"] not in ADVERT_SOURCES for s in c["sightings"]),
+            "platforms": c["platforms"],
             "websites": len(c["sites"]),
-            "linked_payment_details": len(c["identifiers"]),
+            "linked_payment_details": len(c["payment_identifiers"]),
         },
         "recommended_action": ACTIONS[(risk, q.direction)],
         "evidence_pack": f"/v1/campaigns/{cid}/evidence-pack",
@@ -115,7 +124,10 @@ class Ad(BaseModel):
 @app.post("/v1/sightings/ad", dependencies=[Depends(auth)])
 def ingest_ad(ad: Ad):
     r = crawl(ad.model_dump(), EVIDENCE_DIR)
-    store.save_crawl(r)
+    page_ai, extra, unverified = enrich_crawl(r, analyser)
+    store.save_crawl(r, ai=page_ai, extra=extra)
+    seen = {f.identifier.token for f in r.findings}
+    r.findings += [f for f in extra if f.identifier.token not in seen]
     return {
         "ad_id": ad.ad_id,
         "campaign_id": store.campaign_of(ad.ad_id),
@@ -123,8 +135,40 @@ def ingest_ad(ad: Ad):
         "payment_page": r.final_url,
         "payment_details": [{"type": f.identifier.kind, "masked": f.identifier.masked}
                             for f in r.findings],
+        "unverified_payment_details": unverified,
+        "ai_engine": analyser.engine,
         "error": r.error,
     }
+
+
+class SocialPost(BaseModel):
+    submission_id: str = Field(examples=["SUB-001"])
+    platform: Literal["tiktok", "instagram", "facebook", "other"] | None = Field(
+        None, description="Worked out from post_url if not given")
+    post_url: str | None = Field(None, examples=["https://www.tiktok.com/@shop/video/123"])
+    handle: str | None = Field(None, description="Account that posted it")
+    text: str | None = Field(None, description="Caption or ad text, pasted")
+    screenshots_b64: list[str] = Field(
+        default_factory=list, description="Up to 4 screenshots, base64 PNG/JPEG")
+    landing_urls: list[str] = Field(
+        default_factory=list, description="Link in bio or ad destination, if known")
+    follow_links: bool = True
+
+
+@app.post("/v1/sightings/social", dependencies=[Depends(auth)])
+def ingest_social(post: SocialPost):
+    try:
+        images = [base64.b64decode(b, validate=True) for b in post.screenshots_b64[:4]]
+    except (binascii.Error, ValueError):
+        raise HTTPException(422, "screenshots_b64 must be base64")
+    if not (post.text or images or post.landing_urls):
+        raise HTTPException(422, "send at least text, a screenshot or a link")
+    item = SocialItem(
+        platform=post.platform or (platform_of(post.post_url) if post.post_url else "other"),
+        source="submission", source_id=post.submission_id, text=post.text or "",
+        post_url=post.post_url or "", handle=post.handle or "",
+        landing_urls=post.landing_urls, images=images)
+    return process(item, store, EVIDENCE_DIR, analyser, follow_links=post.follow_links)
 
 
 class Report(BaseModel):
@@ -154,11 +198,12 @@ def list_campaigns():
     out = []
     for cid in store.campaign_ids():
         c = store.campaign(cid)
-        if not c["identifiers"]:
+        if not c["payment_identifiers"]:
             continue  # nothing a payment firm can act on
         out.append({"id": cid, "scam_type": c["scam_type"],
+                    "platforms": c["platforms"],
                     "websites": len(c["sites"]),
-                    "payment_details": len(c["identifiers"]),
+                    "payment_details": len(c["payment_identifiers"]),
                     "last_seen": c["last_seen"]})
     return sorted(out, key=lambda c: c["last_seen"], reverse=True)
 
@@ -176,4 +221,4 @@ def evidence_pack(cid: str, format: Literal["json", "html"] = "json"):
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "ai_engine": analyser.engine}

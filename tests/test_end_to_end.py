@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 
 DEMO = Path(__file__).parent.parent / "demo"
 sys.path.insert(0, str(DEMO))
+sys.path.insert(0, str(Path(__file__).parent))
 
 
 class _Quiet(http.server.SimpleHTTPRequestHandler):
@@ -100,11 +101,58 @@ def test_evidence_pack_has_no_raw_identifiers(env):
     client, fx, crawled = env
     cid = crawled["AD-1001"]["campaign_id"]
     pack = client.get(f"/v1/campaigns/{cid}/evidence-pack").json()
-    assert pack["summary"] == {"ads_seen": 2, "victim_reports": 1, "payment_details": 3}
-    assert all(a["path_to_payment"] for a in pack["ads"])
+    assert pack["summary"] == {"ads_and_posts_seen": 2, "victim_reports": 1, "payment_details": 3}
+    assert all(a["path_to_payment"] for a in pack["ads_and_posts"])
     raw = json.dumps(pack)
     k = fx["known"]
     for secret in (k["uk_a"][1], k["uk_b"][1], k["tron"]):
         assert secret not in raw
     html = client.get(f"/v1/campaigns/{cid}/evidence-pack?format=html").text
     assert "data:image/png;base64" in html and k["tron"] not in html
+
+
+def test_social_submission_links_tiktok_screenshot_to_mule_campaign(env):
+    """Screenshot-only TikTok post -> AI reads bank details -> joins the shop campaign."""
+    import base64
+
+    import scamtrace.api as api_mod
+    from scamtrace import ai
+    from test_ai import FakeClient, analysis
+
+    client, fx, crawled = env
+    k = fx["known"]
+    fake = FakeClient(lambda kw: analysis(
+        payment_instructions=[{"kind": "uk_account", "seen_in": "image",
+                               "raw": f"Sort code {k['uk_c'][0]} Account {k['uk_c'][1]}"}],
+        calls_to_action=[{"type": "whatsapp", "value": "07700 900456"}])
+        if "screenshot" not in kw["messages"][0]["content"][-1]["text"] else analysis())
+    old = api_mod.analyser
+    api_mod.analyser = ai.Analyser(client=fake)
+    try:
+        png = (DEMO / "sites" / "_posts" / "tt_furniture.png").read_bytes()
+        r = client.post("/v1/sightings/social", json={
+            "submission_id": "SUB-T1", "handle": "garden.bargains.uk",
+            "post_url": "https://www.tiktok.com/@garden.bargains.uk/video/1",
+            "screenshots_b64": [base64.b64encode(png).decode()]}).json()
+    finally:
+        api_mod.analyser = old
+    assert r["engine"].startswith("claude")
+    assert any(p["type"] == "uk_account" for p in r["payment_details"])
+    shop = client.post("/v1/payee/check", json={
+        "sort_code": k["uk_c"][0], "account_number": k["uk_c"][1]}).json()
+    assert "tiktok" in shop["campaign"]["platforms"]
+    assert shop["campaign"]["id"] == r["campaign_id"]
+    assert client.post("/v1/sightings/social", json={"submission_id": "x"}).status_code == 422
+
+
+def test_database_holds_no_full_identifiers(env):
+    """Privacy by design: no column of any table contains a full identifier."""
+    import scamtrace.api as api_mod
+
+    _, fx, _ = env
+    k = fx["known"]
+    secrets = [k["uk_a"][1], k["uk_b"][1], k["uk_c"][1], k["tron"], k["iban_c"]]
+    db = api_mod.store.db
+    dump = "\n".join(str(tuple(r)) for t in ("sightings", "identifiers")
+                     for r in db.execute(f"SELECT * FROM {t}"))
+    assert dump and not [s for s in secrets if s in dump]

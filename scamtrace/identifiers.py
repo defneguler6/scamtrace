@@ -28,7 +28,12 @@ def token_for(canonical: str) -> str:
 
 # ------------------------------------------------------------ data model
 
-KINDS = ("uk_account", "iban", "btc", "eth", "tron", "payment_link")
+KINDS = ("uk_account", "iban", "btc", "eth", "tron", "payment_link",
+         "phone", "telegram", "social_handle")
+
+# Kinds a payment firm can act on at the moment of payment. The others
+# (contact channels, social accounts) are used to link sightings together.
+PAYMENT_KINDS = frozenset({"uk_account", "iban", "btc", "eth", "tron", "payment_link"})
 
 
 @dataclass(frozen=True)
@@ -219,6 +224,39 @@ def payment_link(url: str) -> Identifier | None:
         return None
     host = low.split("/")[0]
     return Identifier("payment_link", low, f"{host}/…{low[-4:]}")
+
+
+# ------------------------------------------------------ contact channels
+
+
+def phone(raw: str) -> Identifier | None:
+    """WhatsApp / phone number, normalised to international digits."""
+    d = re.sub(r"[^\d+]", "", raw or "")
+    if d.startswith("+"):
+        d = d[1:]
+    elif d.startswith("00"):
+        d = d[2:]
+    elif d.startswith("0") and len(d) == 11:  # UK national format
+        d = "44" + d[1:]
+    if not d.isdigit() or not 10 <= len(d) <= 15:
+        return None
+    return Identifier("phone", d, f"+{d[:2]} …{d[-3:]}")
+
+
+def telegram(raw: str) -> Identifier | None:
+    h = re.sub(r"^(?:https?://)?(?:t\.me|telegram\.me)/", "", (raw or "").strip(), flags=re.I)
+    h = h.lstrip("@").split("?")[0].strip("/").lower()
+    if not re.fullmatch(r"[a-z][a-z0-9_]{4,31}", h):
+        return None
+    return Identifier("telegram", h, f"@{h[:3]}…{h[-2:]}")
+
+
+def social_handle(platform: str, handle: str) -> Identifier | None:
+    h = (handle or "").strip().lstrip("@").lower()
+    p = (platform or "").strip().lower()
+    if not h or not p or not re.fullmatch(r"[a-z0-9._]{2,40}", h):
+        return None
+    return Identifier("social_handle", f"{p}:{h}", f"{p} @{h}")
 
 
 # ------------------------------------------------------ query parsing

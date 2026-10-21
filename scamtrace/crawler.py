@@ -63,7 +63,16 @@ class CrawlResult:
     steps: list[Step] = field(default_factory=list)
     findings: list[Finding] = field(default_factory=list)
     text: str = ""  # page text across the funnel, for clustering/classifying
+    final_text: str = ""  # text of the last page reached (the payment step)
+    evidence_dir: Path | None = None
     error: str | None = None
+
+    @property
+    def final_screenshot(self) -> Path | None:
+        if not self.steps or self.evidence_dir is None:
+            return None
+        p = self.evidence_dir / self.steps[-1].screenshot
+        return p if p.exists() else None
 
     @property
     def final_url(self) -> str:
@@ -148,7 +157,7 @@ def _next_target(page, visited: set[str]):
 def crawl(ad: dict, evidence_dir: Path, max_steps: int = 6,
           timeout_ms: int = 15000) -> CrawlResult:
     """ad needs at least: ad_id, landing_url. Optional: platform, ad_text."""
-    res = CrawlResult(ad=ad)
+    res = CrawlResult(ad=ad, evidence_dir=evidence_dir)
     evidence_dir.mkdir(parents=True, exist_ok=True)
     seen_tokens: set[str] = set()
     texts: list[str] = [ad.get("ad_text", "")]
@@ -201,4 +210,5 @@ def crawl(ad: dict, evidence_dir: Path, max_steps: int = 6,
             browser.close()
 
     res.text = "\n".join(texts)
+    res.final_text = texts[-1] if len(texts) > 1 else ""
     return res

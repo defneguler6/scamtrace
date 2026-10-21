@@ -1,6 +1,13 @@
-"""SQLite store for sightings, payment identifiers and campaigns.
+"""SQLite store for sightings, identifiers and campaigns.
 
 Only keyed hashes and masked forms of identifiers are stored.
+
+Sighting sources:
+  ad_crawl       an advert landing URL followed by the crawler
+  social         a TikTok / Instagram / Facebook post or ad (+ any crawl of
+                 the off-platform link it points to)
+  victim_report  text a victim gave their payment firm
+  partner        intelligence from a partner
 """
 
 from __future__ import annotations
@@ -12,24 +19,18 @@ from pathlib import Path
 
 from . import cluster
 from .classify import classify
-from .crawler import CrawlResult
-from .extract import Finding
+from .extract import Finding, scrub
 
-SCHEMA = """
+ADVERT_SOURCES = {"ad_crawl", "social"}
+
+COLUMNS = ["id", "source", "platform", "post_url", "handle", "ad_text",
+           "landing_url", "final_url", "seen_at", "scam_type", "signals",
+           "pressure", "steps", "media", "text", "error", "ai"]
+
+SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS sightings (
-    id          TEXT PRIMARY KEY,
-    source      TEXT NOT NULL,          -- ad_crawl | victim_report | partner
-    platform    TEXT,
-    ad_text     TEXT,
-    landing_url TEXT,
-    final_url   TEXT,
-    seen_at     TEXT NOT NULL,
-    scam_type   TEXT,
-    signals     TEXT,
-    pressure    TEXT,
-    steps       TEXT,
-    text        TEXT,
-    error       TEXT
+    id TEXT PRIMARY KEY,
+    {", ".join(c + " TEXT" for c in COLUMNS[1:])}
 );
 CREATE TABLE IF NOT EXISTS identifiers (
     sighting_id TEXT NOT NULL REFERENCES sightings(id),
@@ -48,6 +49,8 @@ CREATE TABLE IF NOT EXISTS campaign_members (
 );
 """
 
+JSON_COLS = ("signals", "pressure", "steps", "media", "ai")
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -58,59 +61,73 @@ class Store:
         self.db = sqlite3.connect(str(path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        have = {r[1] for r in self.db.execute("PRAGMA table_info(sightings)")}
+        for c in COLUMNS:  # upgrade databases made by older versions
+            if c not in have:
+                self.db.execute(f"ALTER TABLE sightings ADD COLUMN {c} TEXT")
+        self.db.commit()
 
     # ------------------------------------------------------------ writes
 
-    def _save(self, sid, source, platform, ad_text, landing, final, steps,
-              text, error, findings: list[Finding]):
+    def save(self, sid: str, source: str, findings: list[Finding], *,
+             text: str = "", ai: dict | None = None, **fields):
         cls = classify(text)
-        now = _now()
+        scam_type = cls["scam_type"]
+        if ai and ai.get("engine", "").startswith("claude") and ai.get("scam_type"):
+            scam_type = ai["scam_type"] if ai["scam_type"] != "none" else "unknown"
+        row = {c: None for c in COLUMNS}
+        row.update(fields)
+        text = scrub(text)
+        row["ad_text"] = scrub(row["ad_text"])
+        ai = _scrub_obj(ai)
+        row.update(id=sid, source=source, seen_at=_now(), scam_type=scam_type,
+                   signals=cls["signals"], pressure=cls["pressure_tactics"],
+                   text=text, ai=ai)
+        for c in JSON_COLS:
+            row[c] = json.dumps(row[c] if row[c] is not None else [] if c != "ai" else None)
         self.db.execute(
-            "INSERT OR REPLACE INTO sightings VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (sid, source, platform, ad_text, landing, final, now,
-             cls["scam_type"], json.dumps(cls["signals"]),
-             json.dumps(cls["pressure_tactics"]), json.dumps(steps), text, error),
-        )
+            f"INSERT OR REPLACE INTO sightings ({','.join(COLUMNS)}) "
+            f"VALUES ({','.join('?' * len(COLUMNS))})", [row[c] for c in COLUMNS])
+        self.db.execute("DELETE FROM identifiers WHERE sighting_id=?", (sid,))
         for f in findings:
             self.db.execute(
                 "INSERT OR IGNORE INTO identifiers VALUES (?,?,?,?,?,?,?)",
                 (sid, f.identifier.kind, f.identifier.token, f.identifier.masked,
-                 f.snippet, f.url, now),
-            )
+                 f.snippet, f.url, row["seen_at"]))
         self.db.commit()
         self.recluster()
 
-    def save_crawl(self, r: CrawlResult):
-        self._save(
-            r.ad["ad_id"], "ad_crawl", r.ad.get("platform"), r.ad.get("ad_text"),
-            r.ad["landing_url"], r.final_url,
-            [s.__dict__ for s in r.steps], r.text, r.error, r.findings,
-        )
+    def save_crawl(self, r, ai: dict | None = None, extra: list[Finding] = ()):
+        self.save(
+            r.ad["ad_id"], "ad_crawl", _dedupe(list(r.findings) + list(extra)),
+            text=r.text, ai=ai, platform=r.ad.get("platform"),
+            ad_text=r.ad.get("ad_text"), landing_url=r.ad["landing_url"],
+            final_url=r.final_url, steps=[s.__dict__ for s in r.steps], error=r.error)
 
     def save_report(self, sid: str, text: str, findings: list[Finding],
                     source: str = "victim_report", url: str = ""):
-        self._save(sid, source, None, None, url, url, [], text, None, findings)
+        self.save(sid, source, findings, text=text, landing_url=url, final_url=url)
 
     def recluster(self):
-        rows = self.db.execute("SELECT id, source, landing_url, final_url, text FROM sightings").fetchall()
+        rows = self.db.execute(
+            "SELECT id, source, landing_url, final_url, text FROM sightings").fetchall()
         tokens: dict[str, set] = {}
         for t in self.db.execute("SELECT sighting_id, token FROM identifiers"):
             tokens.setdefault(t["sighting_id"], set()).add(t["token"])
         sightings = [{
             "id": r["id"],
             "tokens": tokens.get(r["id"], set()),
-            # Victim reports link only through payment details: their text
-            # is free-form and their URL may be a platform, not a scam site.
+            # Reports link only through identifiers: their text is free-form
+            # and their URL may be a platform rather than a scam site.
             "urls": [u for u in (r["landing_url"], r["final_url"]) if u]
-                    if r["source"] == "ad_crawl" else [],
-            "text": r["text"] if r["source"] == "ad_crawl" else "",
+                    if r["source"] in ADVERT_SOURCES else [],
+            "text": r["text"] if r["source"] in ADVERT_SOURCES else "",
         } for r in rows]
         groups = cluster.campaigns(sightings)
         self.db.execute("DELETE FROM campaign_members")
         self.db.executemany(
             "INSERT INTO campaign_members VALUES (?,?)",
-            [(cid, sid) for cid, members in groups.items() for sid in members],
-        )
+            [(cid, sid) for cid, members in groups.items() for sid in members])
         self.db.commit()
 
     # ------------------------------------------------------------- reads
@@ -143,10 +160,10 @@ class Store:
                 FROM identifiers WHERE sighting_id IN ({q})
                 GROUP BY token ORDER BY first_seen""", members)]
         for s in sightings:
-            for k in ("signals", "pressure", "steps"):
-                s[k] = json.loads(s[k] or "[]")
-        types = [s["scam_type"] for s in sightings
-                 if s["source"] == "ad_crawl" and s["scam_type"] != "unknown"]
+            for k in JSON_COLS:
+                s[k] = json.loads(s[k]) if s[k] else ([] if k != "ai" else None)
+        adverts = [s for s in sightings if s["source"] in ADVERT_SOURCES]
+        types = [s["scam_type"] for s in adverts if s["scam_type"] not in ("unknown", None)]
         return {
             "campaign_id": cid,
             "scam_type": max(set(types), key=types.count) if types else "unknown",
@@ -154,11 +171,38 @@ class Store:
             "last_seen": sightings[-1]["seen_at"],
             "sightings": sightings,
             "identifiers": idents,
-            "sites": sorted({cluster.site_key(u) for s in sightings
-                             if s["source"] == "ad_crawl"
-                             for u in (s["landing_url"], s["final_url"]) if u}),
+            "payment_identifiers": [i for i in idents if i["kind"] in _payment_kinds()],
+            "platforms": sorted({s["platform"] for s in adverts
+                                 if s["source"] == "social" and s["platform"]}),
+            "sites": sorted({cluster.site_key(u) for s in adverts
+                             for u in (s["landing_url"], s["final_url"]) if u} - {""}),
         }
 
     def campaign_ids(self) -> list[str]:
         return [r[0] for r in self.db.execute(
             "SELECT DISTINCT campaign_id FROM campaign_members")]
+
+
+def _scrub_obj(o):
+    """Scrub every string inside an AI analysis before it is stored."""
+    if isinstance(o, str):
+        return scrub(o)
+    if isinstance(o, list):
+        return [_scrub_obj(x) for x in o]
+    if isinstance(o, dict):
+        return {k: _scrub_obj(v) for k, v in o.items()}
+    return o
+
+
+def _payment_kinds():
+    from .identifiers import PAYMENT_KINDS
+    return PAYMENT_KINDS
+
+
+def _dedupe(findings: list[Finding]) -> list[Finding]:
+    seen, out = set(), []
+    for f in findings:
+        if f.identifier.token not in seen:
+            seen.add(f.identifier.token)
+            out.append(f)
+    return out

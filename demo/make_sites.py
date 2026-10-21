@@ -164,6 +164,113 @@ REPORTS = [
 ]
 
 
+# ------------------------------------------------------- social media
+# Fictional accounts and brands. Post "screenshots" are rendered from a
+# generic card layout, not from any real app's interface.
+
+TRON_JOB = ids.b58encode_check(b"\x41" + bytes(rng.randrange(256) for _ in range(20)))
+
+# Shaped like a record from Meta's Ad Library API (ads_archive).
+META_ADS = [{
+    "id": "90001",
+    "page_name": "QuantumYield Official",
+    "publisher_platforms": ["INSTAGRAM", "FACEBOOK"],
+    "ad_delivery_start_time": "2026-10-14",
+    "ad_snapshot_url": "https://www.facebook.com/ads/archive/render_ad/?id=90001",
+    "ad_creative_bodies": [
+        "Britannia Money Daily: the AI trading app the banks don't want you to "
+        "know about. Members earn daily returns of up to 4%, guaranteed. "
+        "Spaces for UK residents close tonight."],
+    "ad_creative_link_titles": ["Start earning with AI today"],
+    "ad_creative_link_captions": ["quantumyield-ai.example"],
+}]
+
+# Shaped like a record from TikTok's Commercial Content API.
+TIKTOK_ADS = [{
+    "ad": {"id": "70001", "first_shown_date": "20261012", "status": "active",
+           "image_urls": [], "videos": [],
+           "landing_page_url": "hydrospa-outlet.example"},
+    "advertiser": {"business_name": "HydroSpa Outlet UK"},
+}]
+
+# Where the fictional domains live in the demo.
+DOMAIN_MAP = {
+    "quantumyield-ai.example": "yield_a",
+    "hydrospa-outlet.example": "shop_b",
+}
+
+POSTS = {
+    # Organic TikTok post: payment details only in the screenshot.
+    "tt_furniture": {
+        "handle": "garden.bargains.uk", "platform": "TikTok",
+        "lines": ["Clearing my late nan's garden furniture 🌿",
+                  "8-seat rattan corner set, barely used. £150, can deliver.",
+                  "Loads of interest so first to pay the deposit gets it!",
+                  "WhatsApp me: 07700 900456",
+                  "Deposit to: O TRADING",
+                  f"Sort code {UK_C[0]}   Account {UK_C[1]}"],
+    },
+    # TikTok ad creative: the ad library gave no text, only this image.
+    "tt_hydrospa_ad": {
+        "handle": "HydroSpa Outlet UK", "platform": "Sponsored",
+        "lines": ["EX-DISPLAY HOT TUBS FROM £499", "Customs overstock must go",
+                  "Only this week · Free delivery", "Tap Shop now ↓"],
+    },
+    # Instagram job scam: everything in the caption text.
+    "ig_jobs": {
+        "handle": "easytasks.uk.hr", "platform": "Instagram",
+        "lines": ["📲 Earn £300 a day from your phone!", "Just like and review products.",
+                  "No experience needed. Limited places."],
+    },
+    "ig_bakery": {
+        "handle": "rye.and.crumb", "platform": "Instagram",
+        "lines": ["Fresh sourdough every Saturday 🍞", "Find us at the market, stall 12.",
+                  "Pre-orders open on our website."],
+    },
+}
+
+SUBMISSIONS = [
+    {"submission_id": "SUB-T1", "post_url": "https://www.tiktok.com/@garden.bargains.uk/video/7400000000000000001",
+     "handle": "garden.bargains.uk", "text": "", "screenshot": "tt_furniture"},
+    {"submission_id": "SUB-I1", "post_url": "https://www.instagram.com/p/DEMO_JOBS1/",
+     "handle": "easytasks.uk.hr", "screenshot": "ig_jobs",
+     "text": "📲 Earn £300/day from your phone! Just like and review products, no "
+             "experience needed. Limited places. Message our HR team on Telegram "
+             f"@easytasks_uk_hr. Activate your account with a 50 USDT starter fee "
+             f"(TRC20): {TRON_JOB}"},
+    {"submission_id": "SUB-I2", "post_url": "https://www.instagram.com/p/DEMO_BAKERY/",
+     "handle": "rye.and.crumb", "screenshot": "ig_bakery",
+     "text": "Fresh sourdough every Saturday at the market, stall 12. Pre-orders on our website."},
+]
+
+POST_HTML = """<!doctype html><html><head><meta charset=utf-8><style>
+body{{margin:0;font:17px/1.45 system-ui,sans-serif;background:#111;color:#fff;width:390px}}
+.top{{display:flex;align-items:center;gap:10px;padding:14px}}
+.av{{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#f6a,#7af)}}
+.h{{font-weight:600}} .p{{font-size:12px;color:#aaa}}
+.img{{height:230px;background:linear-gradient(160deg,#2d4,#174);display:flex;
+align-items:center;justify-content:center;font-size:58px}}
+.c{{padding:14px 16px 22px}} .c div{{margin:3px 0}}
+</style></head><body><div class=top><div class=av></div><div><div class=h>@{handle}</div>
+<div class=p>{platform} · demo post</div></div></div><div class=img>{emoji}</div>
+<div class=c>{lines}</div></body></html>"""
+
+
+def render_posts(out: Path):
+    from playwright.sync_api import sync_playwright
+    out.mkdir(parents=True, exist_ok=True)
+    emoji = {"tt_furniture": "🪑", "tt_hydrospa_ad": "🛁", "ig_jobs": "💸", "ig_bakery": "🥖"}
+    with sync_playwright() as p:
+        b = p.chromium.launch()
+        pg = b.new_page(viewport={"width": 390, "height": 600}, device_scale_factor=2)
+        for key, post in POSTS.items():
+            pg.set_content(POST_HTML.format(
+                handle=post["handle"], platform=post["platform"], emoji=emoji[key],
+                lines="".join(f"<div>{l}</div>" for l in post["lines"])))
+            pg.screenshot(path=str(out / f"{key}.png"), full_page=True)
+        b.close()
+
+
 def main():
     for name, files in SITES.items():
         d = ROOT / "sites" / name
@@ -175,8 +282,11 @@ def main():
         "ads": ADS,
         "reports": REPORTS,
         "known": {"uk_a": UK_A, "uk_b": UK_B, "uk_c": UK_C,
-                  "iban_c": IBAN_C, "tron": TRON},
+                  "iban_c": IBAN_C, "tron": TRON, "tron_job": TRON_JOB},
+        "social": {"meta_ads": META_ADS, "tiktok_ads": TIKTOK_ADS,
+                   "domain_map": DOMAIN_MAP, "submissions": SUBMISSIONS},
     }
+    render_posts(ROOT / "sites" / "_posts")
     (ROOT / "fixtures.json").write_text(json.dumps(fixtures, indent=2))
     print(f"wrote {len(SITES)} synthetic sites to {ROOT / 'sites'}")
 

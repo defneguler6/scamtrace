@@ -39,6 +39,12 @@ _ETH = re.compile(r"\b0x[0-9a-fA-F]{40}\b")
 _TRON = re.compile(r"\bT[1-9A-HJ-NP-Za-km-z]{33}\b")
 _BTC = re.compile(r"\b(?:bc1[ac-hj-np-z02-9]{11,71}|[13][1-9A-HJ-NP-Za-km-z]{25,34})\b")
 _URL = re.compile(r"https?://[^\s\"'<>]+", re.I)
+# Contact channels: only when the text says WhatsApp/Telegram, so ordinary
+# customer-service phone numbers are not picked up.
+_WA_LINK = re.compile(r"(?:https?://)?wa\.me/(\+?\d{10,15})", re.I)
+_WA_TEXT = re.compile(r"whats\s?app[^0-9+]{0,20}(\+?[\d][\d\s-]{9,17}\d)", re.I)
+_TG_LINK = re.compile(r"(?:https?://)?t(?:elegram)?\.me/([A-Za-z][A-Za-z0-9_]{4,31})", re.I)
+_TG_TEXT = re.compile(r"telegram[^@\n]{0,20}@([A-Za-z][A-Za-z0-9_]{4,31})", re.I)
 
 _PAIR_WINDOW = 300  # characters between a sort code and its account number
 
@@ -121,8 +127,31 @@ def extract(html: str, url: str = "") -> list[Finding]:
         if e.lower().startswith(("http", "paypal.me", "monzo.me", "revolut.me")):
             add(ids.payment_link(e), _mask_digits(e), e)
 
+    for rx, fn in ((_WA_LINK, ids.phone), (_WA_TEXT, ids.phone),
+                   (_TG_LINK, ids.telegram), (_TG_TEXT, ids.telegram)):
+        for m in rx.finditer(blob):
+            add(fn(m.group(1)), _snippet(blob, m.start(), m.end()), m.group(1))
+
     # A snippet can contain a neighbouring wallet or link: mask those too.
     for f in found.values():
         for raw, masked in sorted(raws.items(), key=lambda kv: -len(kv[0])):
             f.snippet = f.snippet.replace(raw, masked)
+        f.snippet = scrub(f.snippet).replace("@@", "@")
     return list(found.values())
+
+
+_LONG_TOKEN = re.compile(r"\b(?:0x[0-9a-fA-F]{40}|bc1[0-9a-z]{20,80}|[13T][1-9A-HJ-NP-Za-km-z]{25,40})\b")
+
+
+def scrub(text: str) -> str:
+    """Mask anything that could be an account number, IBAN or wallet.
+
+    Used on every piece of free text that is stored (page text, ad copy,
+    snippets), so the database never holds a full identifier. Masking is
+    deterministic, so near-duplicate pages still look alike for clustering.
+    """
+    if not text:
+        return text
+    text = _IBAN.sub(lambda m: m.group(0)[:4] + "…" + m.group(0)[-4:], text)
+    text = _LONG_TOKEN.sub(lambda m: m.group(0)[:5] + "…" + m.group(0)[-4:], text)
+    return re.sub(r"\d(?=(?:[\s-]*\d){4})", "•", text)
