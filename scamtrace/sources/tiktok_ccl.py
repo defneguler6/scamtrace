@@ -7,7 +7,7 @@ https://developers.tiktok.com/doc/commercial-content-api-query-ads
 
 What the API gives (October 2026):
   * ads shown in EU countries only (the website library also shows UK ads,
-    the API does not yet), published after 1 October 2022
+    the API does not yet), published after 1 October 2022 and before today
   * advertiser name, first/last shown dates, status, reach, image URLs and
     video URLs; NO ad text and NO destination link
   * at most 10 ads per request; paginate with search_id
@@ -68,12 +68,19 @@ def parse(rec: dict, client: httpx.Client | None = None,
                 pass
     videos = [v.get("url") for v in ad.get("videos") or [] if isinstance(v, dict) and v.get("url")]
     reach = (ad.get("reach") or {}).get("unique_users_seen")
+
+    def _d(v):  # "20261012" -> "12 Oct 2026" (not mistaken for an account number)
+        try:
+            return date(int(str(v)[:4]), int(str(v)[4:6]), int(str(v)[6:8])).strftime("%-d %b %Y")
+        except (ValueError, TypeError):
+            return None
+
+    first, last = _d(ad.get("first_shown_date")), _d(ad.get("last_shown_date"))
     # No ad text from the API: give the AI the facts it does have.
     facts = [f"Advertiser: {adv.get('business_name')}" if adv.get("business_name") else "",
              f"Paid for by: {adv.get('paid_by') or adv.get('paid_for_by')}"
              if (adv.get("paid_by") or adv.get("paid_for_by")) else "",
-             f"Shown: {ad.get('first_shown_date')} to {ad.get('last_shown_date')}"
-             if ad.get("first_shown_date") else "",
+             (f"Shown from {first}" + (f" to {last}" if last else "")) if first else "",
              f"Unique users reached: {reach}" if reach else "",
              f"Video ad ({len(videos)} video)" if videos else ""]
     item = SocialItem(

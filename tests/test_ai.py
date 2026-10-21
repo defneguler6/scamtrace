@@ -218,3 +218,54 @@ def test_meta_errors_are_explained():
     msg = meta_ad_library.explain_error({"code": 10, "error_subcode": 2332002,
                                          "message": "Application does not have permission"})
     assert "facebook.com/ID" in msg
+
+
+class RefusesForcedTool(FakeClient):
+    def create(self, **kw):
+        self.calls.append(kw)
+        if kw["tool_choice"]["type"] == "tool":
+            raise RuntimeError("Error code: 400 - tool_choice: type \"tool\" and \"any\" "
+                               "are not supported for this model.")
+        return SimpleNamespace(content=[
+            SimpleNamespace(type="text", text="Looking at this post."),
+            SimpleNamespace(type="tool_use", input=analysis(scam_type="job"))])
+
+
+def test_model_that_refuses_forced_tool_falls_back_to_auto():
+    fake = RefusesForcedTool(None)
+    a = ai.Analyser(client=fake, model="m")
+    assert a.analyse("social_post", "x")["scam_type"] == "job"
+    assert [c["tool_choice"]["type"] for c in fake.calls] == ["tool", "auto"]
+    a.analyse("social_post", "y")  # remembers: no forced attempt again
+    assert fake.calls[-1]["tool_choice"]["type"] == "auto" and len(fake.calls) == 3
+
+
+def test_analysis_written_as_text_json_is_accepted():
+    reply = "Here is my analysis:\n" + json.dumps(analysis(scam_type="loan"))
+    fake = FakeClient(None)
+    fake.create = lambda **kw: SimpleNamespace(content=[SimpleNamespace(type="text", text=reply)])
+    assert ai.Analyser(client=fake, model="m").analyse("social_post", "x")["scam_type"] == "loan"
+
+
+def test_safe_analyser_falls_back_instead_of_crashing():
+    fake = FakeClient(None)
+
+    def boom(**kw):
+        raise RuntimeError("rate limited")
+    fake.create = boom
+    safe = ai.SafeAnalyser(ai.Analyser(client=fake, model="m"))
+    out = safe.analyse("social_post", "Earn £300 a day, no experience, HR team on Telegram")
+    assert out["engine"] == "heuristic" and "rate limited" in out["ai_error"]
+    assert safe.engine == "claude"
+
+
+def test_lists_sent_as_json_text_are_read():
+    reply = analysis(
+        red_flags=json.dumps([{"flag": "deposit pressure", "evidence": "first to pay"}]),
+        calls_to_action=json.dumps([{"type": "whatsapp", "value": "07700 900456"}]),
+        payment_instructions=json.dumps([{"kind": "uk_account", "seen_in": "image",
+                                          "raw": "Sort code 00-90-12 Account 40404017"}]))
+    out = ai.Analyser(client=FakeClient(reply), model="m").analyse("social_post", "", [PNG])
+    assert len(out["red_flags"]) == 1 and len(out["calls_to_action"]) == 1
+    found, _ = ai.payment_findings(out)
+    assert [f.identifier.kind for f in found] == ["uk_account"]

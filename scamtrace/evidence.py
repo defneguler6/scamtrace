@@ -155,7 +155,9 @@ def render_html(pack: dict, evidence_dir: Path) -> str:
         posts = "".join(_img(evidence_dir, m, "post") for m in a["screenshots_of_post"])
         tactics = ", ".join(a["pressure_tactics"]) or "none detected"
         where = PLATFORM_LABEL.get(a["platform"] or "", a["platform"] or "")
-        who = f" · @{e(a['account'])}" if a["account"] else ""
+        acct = a["account"] or ""
+        who = (f" · @{e(acct)}" if acct and " " not in acct else
+               f" · {e(acct)}" if acct else "")
         link = (f"<p class=mono><small>{e(a['post_url'])}</small></p>" if a["post_url"] else "")
         kind = "Post" if a["source"] == "social" else "Advert"
         pages = "".join(_ai_html(p, "AI on payment page") for p in a["landing_page_ai"])

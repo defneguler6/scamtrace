@@ -190,24 +190,59 @@ class AnthropicBackend:
         self.client = client
         self.model = model or os.environ.get("SCAMTRACE_MODEL", DEFAULT_MODEL)
 
-    def complete(self, system: str, images: list[dict], text: str) -> tuple[dict, dict]:
-        content = [{"type": "image", "source": {"type": "base64", **img}} for img in images]
-        content.append({"type": "text", "text": text})
-        resp = self.client.messages.create(
+    force_tool = True  # switched off automatically for models that refuse it
+
+    def _create(self, system: str, content: list[dict], force: bool):
+        return self.client.messages.create(
             model=self.model,
             max_tokens=2000,
             system=system,
             tools=[TOOL],
-            tool_choice={"type": "tool", "name": TOOL["name"]},
+            tool_choice=({"type": "tool", "name": TOOL["name"]} if force else {"type": "auto"}),
             messages=[{"role": "user", "content": content}],
         )
-        u = getattr(resp, "usage", None)
-        usage = {"input_tokens": getattr(u, "input_tokens", 0) or 0,
-                 "output_tokens": getattr(u, "output_tokens", 0) or 0}
-        for block in resp.content:
-            if getattr(block, "type", "") == "tool_use":
-                return dict(block.input), usage
+
+    def complete(self, system: str, images: list[dict], text: str) -> tuple[dict, dict]:
+        content = [{"type": "image", "source": {"type": "base64", **img}} for img in images]
+        content.append({"type": "text", "text": text})
+        usage = {"input_tokens": 0, "output_tokens": 0}
+        for attempt in range(2):
+            try:
+                resp = self._create(system, content, self.force_tool)
+            except Exception as e:  # some models do not accept a forced tool
+                if self.force_tool and "tool_choice" in str(e):
+                    self.force_tool = False
+                    resp = self._create(system, content, False)
+                else:
+                    raise
+            u = getattr(resp, "usage", None)
+            usage["input_tokens"] += getattr(u, "input_tokens", 0) or 0
+            usage["output_tokens"] += getattr(u, "output_tokens", 0) or 0
+            texts = []
+            for block in resp.content:
+                if getattr(block, "type", "") == "tool_use":
+                    return dict(block.input), usage
+                if getattr(block, "type", "") == "text":
+                    texts.append(getattr(block, "text", ""))
+            parsed = _json_from_text("\n".join(texts))
+            if parsed:
+                return parsed, usage
+            # Ask once more, explicitly, before giving up.
+            content = content[:-1] + [{"type": "text", "text": text + (
+                "\n\nRespond only by calling the report_scam_analysis tool.")}]
         raise RuntimeError("model did not return an analysis")
+
+
+def _json_from_text(text: str) -> dict | None:
+    """Accept an analysis written as JSON in plain text (some models do this)."""
+    if not text or "{" not in text:
+        return None
+    start, end = text.find("{"), text.rfind("}")
+    try:
+        out = json.loads(text[start:end + 1])
+    except ValueError:
+        return None
+    return out if isinstance(out, dict) and "verdict" in out else None
 
 
 # Known OpenAI-compatible endpoints. Model names change often, so the model
@@ -255,12 +290,22 @@ class OpenAICompatibleBackend:
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         r = self.http.post(f"{self.base_url}/chat/completions", json=body, headers=headers)
         out = r.json()
+        if (r.status_code >= 400 or "error" in out) and "tool_choice" in json.dumps(out):
+            body["tool_choice"] = "auto"  # model refuses a forced tool
+            r = self.http.post(f"{self.base_url}/chat/completions", json=body, headers=headers)
+            out = r.json()
         if r.status_code >= 400 or "error" in out:
             err = out.get("error") if isinstance(out, dict) else out
             raise RuntimeError(f"{self.provider} API error: {err}")
         msg = out["choices"][0]["message"]
         calls = msg.get("tool_calls") or []
+        u = out.get("usage") or {}
+        usage = {"input_tokens": u.get("prompt_tokens", 0) or 0,
+                 "output_tokens": u.get("completion_tokens", 0) or 0}
         if not calls:
+            parsed = _json_from_text(msg.get("content") or "")
+            if parsed:
+                return parsed, usage
             raise RuntimeError("model did not return an analysis")
         args = calls[0]["function"]["arguments"]
         u = out.get("usage") or {}
@@ -350,6 +395,42 @@ class HeuristicAnalyser:
         }
 
 
+class SafeAnalyser:
+    """Wraps a model analyser so one failed call never stops a whole run.
+
+    If the model call fails (network, rate limit, bad response), that item
+    is analysed by the keyword heuristic instead and the error is recorded
+    in the result as "ai_error".
+    """
+
+    def __init__(self, inner):
+        self.inner = inner
+        self._fallback = HeuristicAnalyser()
+        self._warned = set()
+
+    @property
+    def engine(self):
+        return self.inner.engine
+
+    @property
+    def model(self):
+        return getattr(self.inner, "model", "")
+
+    def analyse(self, kind, text="", images=(), context=None):
+        try:
+            return self.inner.analyse(kind, text, images, context)
+        except Exception as e:
+            msg = str(e)[:300]
+            key = type(e).__name__ + msg[:80]
+            if key not in self._warned:
+                self._warned.add(key)
+                print(f"[scamtrace] AI call failed, using keyword fallback for this item: {msg}",
+                      file=sys.stderr)
+            out = self._fallback.analyse(kind, text, images, context)
+            out["ai_error"] = msg
+            return out
+
+
 def from_env():
     """The configured model, or the heuristic if it is not set up.
 
@@ -359,7 +440,8 @@ def from_env():
     if os.environ.get("SCAMTRACE_AI", "on") == "off":
         return HeuristicAnalyser()
     try:
-        return make_analyser()
+        a = make_analyser()
+        return a if a.engine == "heuristic" else SafeAnalyser(a)
     except Exception as e:  # key missing, SDK missing, misconfigured
         if os.environ.get("SCAMTRACE_PROVIDER"):
             print(f"[scamtrace] AI provider not available ({e}); using heuristic",
@@ -371,7 +453,15 @@ def _clean(a: dict) -> dict:
     if not (a.get("impersonates") or "").strip() or str(a.get("impersonates")).lower() in ("none", "null"):
         a["impersonates"] = None
     for k in ("red_flags", "calls_to_action", "payment_instructions"):
-        a[k] = [x for x in a.get(k) or [] if isinstance(x, dict)]
+        v = a.get(k) or []
+        if isinstance(v, str):  # some models send nested lists as JSON text
+            try:
+                v = json.loads(v)
+            except ValueError:
+                v = []
+        if isinstance(v, dict):
+            v = [v]
+        a[k] = [x for x in v if isinstance(x, dict)] if isinstance(v, list) else []
     try:
         a["scam_likelihood"] = max(0.0, min(1.0, float(a.get("scam_likelihood", 0))))
     except (TypeError, ValueError):
