@@ -49,6 +49,8 @@ class SocialItem:
     images: list[bytes] = field(default_factory=list)
     snapshot_url: str = ""
     first_seen: str = ""
+    image_urls: list[str] = field(default_factory=list)
+    video_urls: list[str] = field(default_factory=list)
 
     @property
     def sighting_id(self) -> str:

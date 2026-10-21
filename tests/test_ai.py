@@ -184,9 +184,9 @@ def test_meta_error_is_raised():
 
 
 def test_tiktok_parse_and_search():
-    rec = {"ad": {"id": 7, "landing_page_url": "https://hydrospa.example",
-                  "image_urls": ["https://cdn.example/a.png"]},
-           "advertiser": {"business_name": "HydroSpa"}}
+    rec = {"ad": {"id": 7, "first_shown_date": "20261012", "image_urls": ["https://cdn.example/a.png"],
+                  "videos": [{"url": "https://cdn.example/v.mp4"}], "reach": {"unique_users_seen": "10K-100K"}},
+           "advertiser": {"business_name": "HydroSpa", "paid_by": "HydroSpa Ltd"}}
 
     def handler(request):
         if request.url.path.endswith("/oauth/token/"):
@@ -195,7 +195,8 @@ def test_tiktok_parse_and_search():
             return httpx.Response(200, content=PNG)
         assert request.headers["Authorization"] == "Bearer tok"
         body = json.loads(request.content)
-        assert body["filters"]["country_code"] == "GB"
+        assert body["filters"]["country_code"] == "IE" and body["max_count"] == 10
+        assert "ad.landing_page_url" not in request.url.params["fields"]
         return httpx.Response(200, json={"data": {"ads": [rec], "has_more": False},
                                          "error": {"code": "ok"}})
 
@@ -206,5 +207,14 @@ def test_tiktok_parse_and_search():
     finally:
         del os.environ["TIKTOK_CLIENT_KEY"], os.environ["TIKTOK_CLIENT_SECRET"]
     assert items[0].platform == "tiktok" and items[0].handle == "HydroSpa"
-    assert items[0].landing_urls == ["https://hydrospa.example"]
-    assert items[0].images == [PNG]
+    assert items[0].landing_urls == [] and items[0].images == [PNG]
+    assert items[0].video_urls == ["https://cdn.example/v.mp4"]
+    assert "Paid for by: HydroSpa Ltd" in items[0].text and "10K-100K" in items[0].text
+
+
+def test_meta_errors_are_explained():
+    msg = meta_ad_library.explain_error({"code": 190, "message": "Session has expired"})
+    assert "expired" in msg and "Graph API Explorer" in msg
+    msg = meta_ad_library.explain_error({"code": 10, "error_subcode": 2332002,
+                                         "message": "Application does not have permission"})
+    assert "facebook.com/ID" in msg
