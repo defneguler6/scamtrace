@@ -95,7 +95,9 @@ def build(c: dict) -> dict:
             "step, filling forms only with a synthetic decoy profile and never "
             "paying. AI analysis is advisory: every account number or wallet "
             "it reports is re-checked by deterministic validators before it is "
-            "stored. Identifiers are stored as keyed hashes and shown masked."
+            "stored. The database holds identifiers only as keyed hashes and "
+            "masked forms; screenshots show each page exactly as captured and "
+            "are kept as separate evidence files."
         ),
     }
 
@@ -184,6 +186,15 @@ td,th{{border-bottom:1px solid #e3e7ee;padding:6px 8px;text-align:left;vertical-
 .ai{{background:#f3f6fc;border-left:3px solid #3b5bdb;padding:8px 12px;margin:10px 0;border-radius:4px}}
 .ai ul{{margin:4px 0}} .pill{{background:#3b5bdb;color:#fff;border-radius:10px;padding:1px 8px;font-size:13px}}
 .note{{background:#f4f6fa;padding:10px 14px;border-radius:8px;font-size:13px}}
+@media print{{body{{margin:0;max-width:none;font-size:11px}} .kpi,tr,.ai{{break-inside:avoid}}
+h3{{break-after:avoid}} .ad{{padding:8px 12px;margin:10px 0}}
+.ad ol{{display:flex;flex-wrap:wrap;gap:8px;padding:0;list-style:none;counter-reset:s}}
+.ad ol li{{width:31%;break-inside:avoid;counter-increment:s;font-size:9.5px;word-break:break-all}}
+.ad ol li::before{{content:"Step " counter(s) ": ";font-weight:600}}
+.shot img{{max-width:100%;max-height:300px;object-fit:cover;object-position:top}}
+.posts img{{max-width:170px;max-height:300px;object-fit:cover;object-position:top}}
+*{{-webkit-print-color-adjust:exact;print-color-adjust:exact}}}}
+@page{{size:A4;margin:14mm 12mm}}
 </style></head><body>
 <h1>Scam campaign evidence pack · {e(pack['campaign_id'])}</h1>
 <div class=muted>Type: {e(pack['scam_type'])} · platforms: {e(plats)} · first seen {e(pack['first_seen'])} ·
@@ -196,3 +207,17 @@ last seen {e(pack['last_seen'])} · generated {e(pack['generated_at'])}</div>
 <table>{head}{_rows(pack['payment_details'])}</table>{linked}
 <h2>Ads, posts and path to payment</h2>{items}
 <p class=note>{e(pack['method_note'])}</p></body></html>"""
+
+
+def html_to_pdf(html_text: str, path: Path) -> Path:
+    """Render an evidence pack to an A4 PDF with the headless browser."""
+    from playwright.sync_api import sync_playwright
+    path = Path(path)
+    with sync_playwright() as p:
+        b = p.chromium.launch()
+        page = b.new_page()
+        page.set_content(html_text, wait_until="load")
+        page.pdf(path=str(path), format="A4", print_background=True,
+                 prefer_css_page_size=True)
+        b.close()
+    return path

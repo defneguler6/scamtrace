@@ -38,6 +38,27 @@ FIELDS = ",".join([
 _DOMAIN = re.compile(r"^(?:https?://)?([a-z0-9-]+(?:\.[a-z0-9-]+)+)(/\S*)?$", re.I)
 
 
+def explain_error(err: dict) -> str:
+    """Meta's error plus a plain-English hint for the usual causes."""
+    code, sub = err.get("code"), err.get("error_subcode")
+    msg = err.get("error_user_msg") or err.get("message") or "unknown error"
+    hint = ""
+    if code == 190:
+        hint = ("The access token has expired or is invalid. Generate a new one in "
+                "the Graph API Explorer and paste it into .env.")
+    elif code in (10, 200) or sub == 2332002 or "confirm" in msg.lower():
+        hint = ("Meta needs you to confirm your identity before using the Ad "
+                "Library API. Complete it at facebook.com/ID, wait for approval "
+                "(usually 1-3 days), then generate a new token.")
+    elif code == 100:
+        hint = ("Meta rejected a search parameter. Try a different country "
+                "(e.g. --countries IE) or a simpler search term.")
+    elif code in (4, 17, 613):
+        hint = "Rate limit reached. Wait a while and try again."
+    detail = f"code {code}" + (f", subcode {sub}" if sub else "")
+    return f"Meta API error ({detail}): {msg}" + (f"\n  -> {hint}" if hint else "")
+
+
 def parse(rec: dict) -> SocialItem:
     """One ads_archive record -> SocialItem."""
     bodies = rec.get("ad_creative_bodies") or []
@@ -89,7 +110,7 @@ def search(terms: str, countries=("GB", "IE"), platforms=("INSTAGRAM",),
         resp = client.get(url, params=params)
         body = resp.json()
         if "error" in body:
-            raise RuntimeError(f"Meta API error: {body['error'].get('message')}")
+            raise RuntimeError(explain_error(body["error"]))
         items += [parse(r) for r in body.get("data", [])]
         url = (body.get("paging") or {}).get("next")
         params = None  # the next URL already carries the query

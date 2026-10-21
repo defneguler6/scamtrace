@@ -156,3 +156,11 @@ def test_database_holds_no_full_identifiers(env):
     dump = "\n".join(str(tuple(r)) for t in ("sightings", "identifiers")
                      for r in db.execute(f"SELECT * FROM {t}"))
     assert dump and not [s for s in secrets if s in dump]
+
+
+def test_evidence_pack_pdf(env):
+    client, _, crawled = env
+    cid = crawled["AD-2001"]["campaign_id"]
+    r = client.get(f"/v1/campaigns/{cid}/evidence-pack?format=pdf")
+    assert r.status_code == 200 and r.content[:5] == b"%PDF-"
+    assert r.headers["content-type"] == "application/pdf"

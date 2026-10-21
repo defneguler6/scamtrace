@@ -161,7 +161,9 @@ def main():
         (OUT / f"evidence_{c['id']}.json").write_text(json.dumps(pack, indent=2))
         html = api.get(f"/v1/campaigns/{c['id']}/evidence-pack?format=html").text
         (OUT / f"evidence_{c['id']}.html").write_text(html)
-        print(f"{OUT / ('evidence_' + c['id'] + '.html')}")
+        (OUT / f"evidence_{c['id']}.pdf").write_bytes(
+            api.get(f"/v1/campaigns/{c['id']}/evidence-pack?format=pdf").content)
+        print(f"{OUT / ('evidence_' + c['id'])}.html / .pdf")
 
     if engine == "heuristic":
         print("\nNote: AI was off, so the bank details that appear only in the TikTok "

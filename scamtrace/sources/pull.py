@@ -27,6 +27,8 @@ def main(argv=None):
     p.add_argument("--country", default="GB", help="tiktok")
     p.add_argument("--limit", type=int, default=50)
     p.add_argument("--min-likelihood", type=float, default=0.5)
+    p.add_argument("--list", action="store_true",
+                   help="only list the ads found: no AI, no website visits, nothing stored")
     a = p.parse_args(argv)
 
     if a.library == "meta":
@@ -35,6 +37,14 @@ def main(argv=None):
     else:
         from .tiktok_ccl import search
         items = search(a.terms, country=a.country, max_count=a.limit)
+
+    if a.list:
+        print(f"{len(items)} ads from {a.library}:")
+        for it in items:
+            text = " ".join(it.text.split())[:110]
+            links = ", ".join(it.landing_urls) or "no link"
+            print(f"- {it.platform:<9} {it.handle[:28]:<28} {text}  [{links}]")
+        return
 
     store = Store(os.environ.get("SCAMTRACE_DB", "scamtrace.db"))
     evidence = Path(os.environ.get("SCAMTRACE_EVIDENCE", "evidence"))

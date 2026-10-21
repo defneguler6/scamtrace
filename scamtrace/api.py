@@ -5,7 +5,7 @@
     POST /v1/sightings/ad           crawl a scam advert landing page
     POST /v1/sightings/report       add a victim or partner report
     GET  /v1/campaigns              list campaigns
-    GET  /v1/campaigns/{id}/evidence-pack?format=json|html
+    GET  /v1/campaigns/{id}/evidence-pack?format=json|html|pdf
 
 Run:  uvicorn scamtrace.api:app --reload
 """
@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field
 
 import base64
@@ -209,13 +209,20 @@ def list_campaigns():
 
 
 @app.get("/v1/campaigns/{cid}/evidence-pack", dependencies=[Depends(auth)])
-def evidence_pack(cid: str, format: Literal["json", "html"] = "json"):
+def evidence_pack(cid: str, format: Literal["json", "html", "pdf"] = "json"):
     c = store.campaign(cid)
     if not c:
         raise HTTPException(404, "unknown campaign")
     pack = evidence.build(c)
     if format == "html":
         return HTMLResponse(evidence.render_html(pack, EVIDENCE_DIR))
+    if format == "pdf":
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            pdf = evidence.html_to_pdf(evidence.render_html(pack, EVIDENCE_DIR),
+                                       Path(d) / f"{cid}.pdf").read_bytes()
+        return Response(pdf, media_type="application/pdf", headers={
+            "Content-Disposition": f'attachment; filename="evidence_{cid}.pdf"'})
     return pack
 
 

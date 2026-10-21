@@ -36,7 +36,7 @@ networks.
                                                       │   WhatsApp / account /
                                                       ▼   site / page kit
                       payment firm ─▶ POST /v1/payee/check
-                                      GET  /v1/campaigns/{id}/evidence-pack
+                                      GET  /v1/campaigns/{id}/evidence-pack   (json, html or pdf)
 ```
 
 ### Where social media content comes from
@@ -147,7 +147,7 @@ source .venv/bin/activate
 cp .env.example .env               # then paste your ANTHROPIC_API_KEY into .env
 
 python demo/run_demo.py            # end-to-end demo, writes demo/output/
-python -m pytest                   # 35 tests, no network or API key needed
+python -m pytest                   # 36 tests, no network or API key needed
 bash run_api.sh                    # API on the demo data: http://127.0.0.1:8000/docs
 ```
 
